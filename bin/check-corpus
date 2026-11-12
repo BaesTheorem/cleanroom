@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Scrub every file in a folder, then ask outside tools if the result is clean.
 
-    tools/check-corpus [FOLDER ...]        default: corpus/
+    bin/check-corpus [FOLDER ...]        default: corpus/
 
 For each file the script runs the `scrub` command and then four checks that do
 not use the scrubber's own code:

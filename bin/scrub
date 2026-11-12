@@ -1,0 +1,10 @@
+#!/bin/bash
+# Run the Mac command-line scrubber. Builds it on first use.
+#   bin/scrub clean photo.jpg -o out     bin/scrub inspect photo.heic
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+BINARY="$ROOT/ScrubKit/.build/release/scrub"
+if [[ ! -x $BINARY || -n $(find "$ROOT/ScrubKit/Sources" -newer "$BINARY" -name '*.swift' -print -quit) ]]; then
+  swift build -c release --package-path "$ROOT/ScrubKit" >&2
+fi
+exec "$BINARY" "$@"

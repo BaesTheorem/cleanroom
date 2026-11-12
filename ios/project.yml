@@ -1,0 +1,93 @@
+# XcodeGen spec: `xcodegen generate` writes Cleanroom.xcodeproj (gitignored).
+# Config/App.xcconfig includes Signing.xcconfig, which is gitignored (see the
+# .example file).
+name: Cleanroom
+options:
+  deploymentTarget:
+    iOS: "18.0"
+  createIntermediateGroups: true
+  groupSortPosition: top
+
+configFiles:
+  Debug: Config/App.xcconfig
+  Release: Config/App.xcconfig
+
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    CODE_SIGN_STYLE: Automatic
+    ENABLE_USER_SCRIPT_SANDBOXING: NO
+    MARKETING_VERSION: "1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    TARGETED_DEVICE_FAMILY: "1"
+    SWIFT_STRICT_CONCURRENCY: minimal
+
+packages:
+  ScrubKit:
+    path: ../ScrubKit
+
+targets:
+  Cleanroom:
+    type: application
+    platform: iOS
+    sources:
+      - path: Cleanroom/Sources
+      - path: Cleanroom/Resources
+      - path: Shared/Sources
+      - path: Shared/Fonts
+        excludes: ["*.txt"]
+    dependencies:
+      - package: ScrubKit
+      - target: CleanroomShare
+    info:
+      path: Cleanroom/Info.plist
+      properties:
+        CFBundleDisplayName: Cleanroom
+        CFBundleExecutable: $(EXECUTABLE_NAME)
+        CFBundlePackageType: APPL
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        UILaunchScreen:
+          UIColorName: LaunchBackground
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        UIUserInterfaceStyle: Dark
+        ITSAppUsesNonExemptEncryption: false
+        LSSupportsOpeningDocumentsInPlace: false
+        NSPhotoLibraryAddUsageDescription: Cleanroom saves the scrubbed copy to your library. It cannot read your library.
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: $(BUNDLE_ID_PREFIX).cleanroom
+        TARGETED_DEVICE_FAMILY: "1"  # the iOS app preset sets "1,2" here, over the project value
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+
+  CleanroomShare:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: CleanroomShare
+      - path: Shared/Sources
+      - path: Shared/Fonts
+        excludes: ["*.txt"]
+    dependencies:
+      - package: ScrubKit
+    info:
+      path: CleanroomShare/Info.plist
+      properties:
+        CFBundleDisplayName: Cleanroom
+        CFBundleExecutable: $(EXECUTABLE_NAME)
+        CFBundlePackageType: XPC!
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        NSPhotoLibraryAddUsageDescription: Cleanroom saves the scrubbed copy to your library. It cannot read your library.
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.share-services
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).ShareViewController
+          NSExtensionAttributes:
+            NSExtensionActivationRule:
+              NSExtensionActivationSupportsImageWithMaxCount: 50
+              NSExtensionActivationSupportsMovieWithMaxCount: 10
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: $(BUNDLE_ID_PREFIX).cleanroom.share
+        TARGETED_DEVICE_FAMILY: "1"

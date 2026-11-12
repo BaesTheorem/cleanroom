@@ -5,7 +5,7 @@ import XCTest
 @testable import ScrubKit
 
 /// These tests make their own pictures with ImageIO, so they need no sample
-/// files. The corpus check in tools/check-corpus covers real camera files.
+/// files. The corpus check in bin/check-corpus covers real camera files.
 final class ScrubTests: XCTestCase {
     private var work: URL!
 

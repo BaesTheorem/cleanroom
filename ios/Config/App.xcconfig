@@ -1,0 +1,3 @@
+// Signing (team, bundle id prefix). The included file is gitignored: see
+// Signing.xcconfig.example.
+#include "Signing.xcconfig"
