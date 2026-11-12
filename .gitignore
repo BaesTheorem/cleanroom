@@ -1,0 +1,9 @@
+.DS_Store
+.build/
+*.xcodeproj
+ios/build/
+ios/Config/Signing.xcconfig
+# Test media. Private files hold real locations and device data, and public
+# samples are downloaded by tools/fetch-corpus.
+corpus/
+out/

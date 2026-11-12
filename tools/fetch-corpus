@@ -1,0 +1,62 @@
+#!/bin/bash
+# Download public sample files into corpus/public (gitignored), and make
+# synthetic files with planted CANARY metadata in corpus/synthetic.
+# The pictures come from github.com/ianare/exif-samples: many camera makers,
+# GPS, XMP, all eight orientations, HEIC from phones, and broken files.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+mkdir -p corpus/public corpus/synthetic
+if [[ ! -d corpus/public/exif-samples ]]; then
+  git clone --quiet --depth 1 https://github.com/ianare/exif-samples.git corpus/public/exif-samples
+  rm -rf corpus/public/exif-samples/.git
+fi
+
+cd corpus/synthetic
+GPS=(-GPSLatitude=39.0997 -GPSLatitudeRef=N -GPSLongitude=94.5786 -GPSLongitudeRef=W -GPSAltitude=250)
+TAGS=(-Make=CANARYMAKE -Model="CANARYMODEL 16" -Software=CANARYSOFT -Artist=CANARYARTIST -Copyright=CANARYCOPY
+      -DateTimeOriginal="2026:11:01 10:00:00" -SerialNumber=CANARYSERIAL -LensSerialNumber=CANARYLENS -OwnerName=CANARYOWNER
+      -UserComment=CANARYCOMMENT -ImageUniqueID=CANARYUNIQUE -XMP-dc:Creator=CANARYXMP -XMP-xmp:CreatorTool=CANARYTOOL
+      -XMP-photoshop:City=CANARYCITY)
+
+base() {  # NAME EXTRA_FFMPEG_ARGS...: a small test picture
+  local name=$1; shift
+  ffmpeg -v error -y -f lavfi -i testsrc2=size=640x480:rate=1 -frames:v 1 "$@" "$name"
+}
+
+base plain.jpg -q:v 3
+base thumb.jpg -vf scale=160:120 -q:v 5
+cp plain.jpg tagged.jpg
+exiftool -q -overwrite_original "${GPS[@]}" "${TAGS[@]}" -IPTC:By-line=CANARYIPTC -IPTC:City=CANARYCITY -Comment=CANARYCOM \
+  -Orientation#=6 "-ThumbnailImage<=thumb.jpg" tagged.jpg
+cp tagged.jpg trailer.jpg && printf 'CANARY-TRAILER-DATA-AFTER-THE-END-MARKER' >> trailer.jpg
+base progressive.jpg -q:v 3 -vf format=yuvj444p
+exiftool -q -overwrite_original "${GPS[@]}" "${TAGS[@]}" -Orientation#=8 progressive.jpg
+
+base tagged.png
+exiftool -q -overwrite_original "${GPS[@]}" "${TAGS[@]}" -PNG:Author=CANARYPNG -PNG:Comment=CANARYPNGCOMMENT -Orientation#=3 tagged.png
+printf 'CANARY-TRAILER' >> tagged.png
+
+sips -s format heic plain.jpg --out tagged.heic >/dev/null
+exiftool -q -overwrite_original "${GPS[@]}" "${TAGS[@]}" tagged.heic
+sips -s format tiff plain.jpg --out tagged.tiff >/dev/null
+exiftool -q -overwrite_original "${GPS[@]}" "${TAGS[@]}" tagged.tiff
+ffmpeg -v error -y -f lavfi -i testsrc2=size=320x240:rate=5 -frames:v 5 tagged.gif
+exiftool -q -overwrite_original -Comment=CANARYGIF -XMP-dc:Creator=CANARYXMP tagged.gif
+
+movie() {  # NAME ARGS...: three seconds of video and sound
+  local name=$1; shift
+  ffmpeg -v error -y -f lavfi -i testsrc2=size=640x360:rate=30 -f lavfi -i sine=frequency=440:sample_rate=48000 -t 3 "$@" "$name"
+}
+QT=(-Keys:GPSCoordinates="39.0997, -94.5786, 250" -Keys:Make=CANARYMAKE -Keys:Model="CANARYMODEL 16" -Keys:Software=CANARYSOFT
+    -Keys:CreationDate="2026:11:01 10:00:00-05:00" -UserData:GPSCoordinates="39.0997, -94.5786" -UserData:Artist=CANARYARTIST
+    -XMP:Creator=CANARYXMP)
+movie base-h264.mov -c:v libx264 -pix_fmt yuv420p -c:a aac -movflags +faststart
+movie base-hevc.mov -c:v hevc_videotoolbox -tag:v hvc1 -c:a aac
+movie base-h264.mp4 -c:v libx264 -pix_fmt yuv420p -c:a aac -metadata title=CANARY-TITLE -metadata artist=CANARY-ARTIST \
+  -metadata location=+39.0997-094.5786/
+movie timecode.mov -c:v libx264 -pix_fmt yuv420p -c:a aac -timecode 10:00:00:00
+ffmpeg -v error -y -display_rotation 90 -i base-h264.mov -c copy rotated.mov
+exiftool -q -overwrite_original "${QT[@]}" base-h264.mov base-hevc.mov timecode.mov rotated.mov
+exiftool -q -overwrite_original -XMP:Creator=CANARYXMP -ItemList:Comment=CANARYCOMMENT base-h264.mp4
+rm -f thumb.jpg
+echo "corpus ready: $(find .. -type f | wc -l | tr -d ' ') files"

@@ -1,0 +1,225 @@
+#!/usr/bin/env python3
+"""Scrub every file in a folder, then ask outside tools if the result is clean.
+
+    tools/check-corpus [FOLDER ...]        default: corpus/
+
+For each file the script runs the `scrub` command and then four checks that do
+not use the scrubber's own code:
+
+  tags     ExifTool reads the output. Every tag must be on the allowlist below.
+  residue  16-byte pieces of the original Exif and XMP blocks, and planted
+           CANARY strings, must not occur anywhere in the output bytes.
+  decode   ffmpeg decodes the picture before and after (or copies the movie
+           packets). The hashes must match. HEIC uses ImageIO full-size decode.
+  valid    `exiftool -validate` must report no error.
+
+Needs exiftool and ffmpeg on PATH, and `swift build` in ScrubKit first.
+"""
+import json
+import pathlib
+import re
+import subprocess
+import sys
+import tempfile
+import time
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+SCRUB = ROOT / "ScrubKit/.build/debug/scrub"
+MEDIA = {".jpg", ".jpeg", ".png", ".heic", ".heif", ".avif", ".mov", ".mp4", ".m4v", ".tif", ".tiff", ".gif", ".webp", ".dng", ".bmp"}
+
+# ExifTool family-1 groups that only describe structure or rendering.
+OPEN_GROUPS = re.compile(r"^(System|ExifTool|File|Composite|JFIF|ICC_Profile\d*|ICC-(header|view|meas|cicp|chrm)\d*|PNG|PNG-pHYs|PNG-cICP|"
+                         r"MPF\d|MPImage\d+|Meta|QuickTime|Track\d+|GIF|RIFF|APP2|Adobe|XMP-apdi|XMP-HDRGainMap|XMP-hdrgm)$")
+# Groups where only the named tags can stay.
+NAMED = {
+    "IFD0": {"Orientation", "YCbCrPositioning", "XResolution", "YResolution", "ResolutionUnit", "ImageWidth", "ImageHeight",
+             "BitsPerSample", "Compression", "PhotometricInterpretation", "SamplesPerPixel", "RowsPerStrip", "StripOffsets",
+             "StripByteCounts", "PlanarConfiguration", "Predictor", "TileWidth", "TileLength", "TileOffsets", "TileByteCounts",
+             "ExtraSamples", "SampleFormat", "FillOrder"},
+    "ExifIFD": {"ExifVersion", "ComponentsConfiguration", "ColorSpace", "ExifImageWidth", "ExifImageHeight", "FlashpixVersion",
+                "SceneCaptureType"},
+    "InteropIFD": {"InteropIndex", "InteropVersion"},
+    "Apple": {"HDRHeadroom", "HDRGain"},
+    "XMP-x": {"XMPToolkit"},
+}
+DATE_TAGS = {"CreateDate", "ModifyDate", "TrackCreateDate", "TrackModifyDate", "MediaCreateDate", "MediaModifyDate"}
+
+
+def run(*args, binary=False):
+    out = subprocess.run(args, capture_output=True)
+    return out.stdout if binary else out.stdout.decode("utf-8", "replace")
+
+
+STANDARD_PROFILES = {"sRGB IEC61966-2.1", "Display P3", "Adobe RGB (1998)", "sRGB", "Generic RGB Profile", "Generic Gray Gamma 2.2 Profile",
+                     "Generic Gray Profile", "ProPhoto RGB", "ROMM RGB: ISO 22028-2:2013", "Rec. ITU-R BT.709-5", "Rec. ITU-R BT.2020-1",
+                     "DCI P3", "Dot Gain 20%", "Generic CMYK Profile", "sRGB built-in", "Linear Gray", "Gray Gamma 2.2"}
+
+
+def dates_of(path):
+    """Every date ExifTool reads from a file, cut to the minute."""
+    rows = json.loads(run("exiftool", "-j", "-a", "-G1", "-time:all", "-ee3", str(path)) or "[{}]")[0]
+    # The profile's own date is not a date of the file, so it is not in the set.
+    return {str(v)[:16] for k, v in rows.items() if not k.startswith(("System:", "File:", "SourceFile", "ICC-"))}
+
+
+def tags_check(path, started, original_dates=frozenset()):
+    rows = json.loads(run("exiftool", "-j", "-a", "-G1", "-u", "-ee3", "-api", "largefilesupport=1", str(path)) or "[{}]")[0]
+    bad = []
+    for key, value in rows.items():
+        if ":" not in key:
+            continue
+        group, tag = key.split(":", 1)
+        if tag == "ProfileDateTime" and str(value) != "0000:00:00 00:00:00":
+            # A date can stay in a standard profile (every copy of sRGB has the
+            # same one). It must never be a date of the original file.
+            number = group.replace("ICC-header", "")
+            name = str(rows.get(f"ICC_Profile{number}:ProfileDescription", ""))
+            if name not in STANDARD_PROFILES or str(value)[:16] in original_dates:
+                bad.append(f"{key}={value} ({name})")
+        if OPEN_GROUPS.match(group):
+            if group.startswith(("QuickTime", "Track")) and tag in DATE_TAGS and str(value) != "0000:00:00 00:00:00":
+                # A movie header date can only be the time of this run (UTC).
+                try:
+                    stamp = time.mktime(time.strptime(str(value)[:19], "%Y:%m:%d %H:%M:%S")) - time.timezone
+                except ValueError:
+                    stamp = 0
+                if stamp < started - 120:
+                    bad.append(f"{key}={value}")
+            continue
+        if tag in NAMED.get(group, ()):
+            continue
+        bad.append(f"{key}")
+    return bad
+
+
+def shingles(blob, skip=(0, 0), size=16, step=4):
+    """16-byte pieces of a block, without padding, runs and the `skip` range."""
+    seen = set()
+    for i in range(0, max(0, len(blob) - size), step):
+        if skip[0] - size < i < skip[1]:
+            continue
+        piece = blob[i:i + size]
+        if len(set(piece)) >= 8:
+            seen.add(piece)
+    return seen
+
+
+def jpeg_header_length(image):
+    """Bytes of a JPEG before its compressed data: tables that many files share."""
+    at = image.find(b"\xff\xda")
+    return at + 2 + int.from_bytes(image[at + 2:at + 4], "big") if at > 0 else 0
+
+
+def gps_raw(tiff):
+    """The raw latitude and longitude bytes of an Exif block (24 bytes each)."""
+    try:
+        order = "little" if tiff[:2] == b"II" else "big"
+        num = lambda o, n: int.from_bytes(tiff[o:o + n], order)
+        def entries(ifd):
+            return {num(ifd + 2 + 12 * i, 2): ifd + 2 + 12 * i for i in range(num(ifd, 2))}
+        gps = entries(num(4, 4)).get(0x8825)
+        if gps is None:
+            return []
+        found = entries(num(gps + 8, 4))
+        return [tiff[num(found[t] + 8, 4):num(found[t] + 8, 4) + 24] for t in (2, 4) if t in found]
+    except (IndexError, ValueError):
+        return []
+
+
+def residue_check(original, output):
+    """Pieces of the old metadata blocks must not occur in the output.
+
+    Three kinds of piece do not count. A piece that also occurs in the original
+    outside the block is not metadata. The header of the thumbnail holds
+    standard JPEG tables that the picture uses too. A piece inside the new Exif
+    or XMP block of the output is a field the tags check already allowed.
+    """
+    before = pathlib.Path(original).read_bytes()
+    data = pathlib.Path(output).read_bytes()
+    kept = run("exiftool", "-b", "-EXIF", str(output), binary=True) + run("exiftool", "-b", "-XMP", str(output), binary=True)
+    thumb = run("exiftool", "-b", "-ThumbnailImage", str(original), binary=True)
+    thumb_header = jpeg_header_length(thumb)
+    found = 0
+    notes = []
+    for block in ("-EXIF", "-XMP", "-ThumbnailImage", "-IPTC"):
+        blob = run("exiftool", "-b", block, str(original), binary=True)
+        at = before.find(blob) if blob else -1
+        rest = before[:at] + before[at + len(blob):] if at >= 0 else b""
+        skip = (0, 0)
+        if block == "-ThumbnailImage":
+            skip = (0, thumb_header)
+        elif block == "-EXIF" and thumb and blob.find(thumb) >= 0:
+            skip = (blob.find(thumb), blob.find(thumb) + thumb_header)
+        for piece in shingles(blob, skip):
+            if piece in data and piece not in rest and piece not in kept:
+                found += 1
+        if block == "-EXIF" and any(raw in data for raw in gps_raw(blob) if any(raw)):
+            notes.append("the raw GPS coordinates")
+    if found:
+        notes.append(f"{found} pieces of the old Exif or XMP block")
+    for word in (b"CANARY", b"C\x00A\x00N\x00A\x00R\x00Y", b"39.0997", b"94.5786"):
+        if word in data:
+            notes.append("planted string " + word.decode("latin1"))
+    return notes
+
+
+def decode_hash(path):
+    suffix = pathlib.Path(path).suffix.lower()
+    if suffix in {".mov", ".mp4", ".m4v"}:
+        video = run("ffmpeg", "-v", "error", "-i", str(path), "-map", "0:v?", "-c", "copy", "-f", "hash", "-hash", "sha256", "-")
+        audio = run("ffmpeg", "-v", "error", "-i", str(path), "-map", "0:a?", "-c", "copy", "-f", "hash", "-hash", "sha256", "-")
+        return ("ffmpeg packets", video.strip() + audio.strip())
+    if suffix in {".heic", ".heif", ".avif"}:
+        return ("ImageIO full decode", run(str(SCRUB), "pixelhash", "--hdr", str(path)).split(" ")[0])
+    return ("ffmpeg decode", run("ffmpeg", "-v", "error", "-i", str(path), "-map", "0:v:0", "-frames:v", "1", "-f", "hash", "-hash", "sha256", "-").strip())
+
+
+def main():
+    folders = [pathlib.Path(a) for a in sys.argv[1:]] or [ROOT / "corpus"]
+    files = sorted(p for f in folders for p in (f.rglob("*") if f.is_dir() else [f]) if p.suffix.lower() in MEDIA)
+    if not files:
+        sys.exit("no media files found")
+    failures = 0
+    with tempfile.TemporaryDirectory() as tmp:
+        for index, source in enumerate(files):
+            out_dir = pathlib.Path(tmp) / str(index)
+            started = time.time()
+            report = run(str(SCRUB), "clean", str(source), "-o", str(out_dir), "--keep-names", "--json")
+            try:
+                record = json.loads(report)[0]
+            except (ValueError, IndexError):
+                record = {"passed": False, "error": report.strip()[:200]}
+            label = str(source.relative_to(ROOT)) if source.is_relative_to(ROOT) else str(source)
+            if not record.get("output"):
+                failures += 1
+                why = record.get("error") or "; ".join(c["detail"] for c in record.get("checks", []) if not c["passed"])
+                print(f"FAIL  {label}\n      scrubber: {why}")
+                continue
+            output = pathlib.Path(record["output"])
+            problems = []
+            bad = tags_check(output, started, dates_of(source))
+            if bad:
+                problems.append("tags: " + ", ".join(bad[:8]))
+            problems += ["residue: " + n for n in residue_check(source, output)]
+            lossless = record["method"] == "lossless"
+            if lossless:
+                how, before = decode_hash(source)
+                _, after = decode_hash(output)
+                if not before or before != after:
+                    problems.append(f"decode: {how} differs")
+            valid = run("exiftool", "-validate", "-error", "-a", str(output))
+            if "Error" in valid:
+                problems.append("valid: " + valid.strip().splitlines()[-1][:120])
+            own = [c for c in record["checks"] if not c["passed"]]
+            problems += [f"own check {c['name']}: {c['detail']}" for c in own]
+            saved = record["bytesBefore"] - record["bytesAfter"]
+            status = "FAIL" if problems else "ok  "
+            failures += bool(problems)
+            print(f"{status}  {label}  [{record['method']}]  {record['removed']} tags removed, {saved} bytes smaller")
+            for line in problems:
+                print("      " + line)
+    print(f"\n{len(files) - failures} of {len(files)} files clean")
+    sys.exit(1 if failures else 0)
+
+
+main()
